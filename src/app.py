@@ -1,30 +1,32 @@
 # src/app.py — Volatility Infrastructure Platform
 from fastapi import FastAPI
 from fastapi.responses import HTMLResponse
+from contextlib import asynccontextmanager
+import nest_asyncio
+nest_asyncio.apply()
+
 from ib_insync import *
 import pandas as pd
 import numpy as np
 from scipy.stats import norm
 from scipy.optimize import brentq
-import json
 import uvicorn
-
-app = FastAPI(title="Vol Platform")
 
 # === Connexion IBKR ===
 ib = IB()
 
-@app.on_event("startup")
-async def startup():
+@asynccontextmanager
+async def lifespan(app):
+    util.startLoop()
     ib.connect('127.0.0.1', 4002, clientId=10)
     ib.reqMarketDataType(3)
     print("✅ IBKR connecté")
-
-@app.on_event("shutdown")
-async def shutdown():
+    yield
     ib.disconnect()
 
-# === Maths (même code que les notebooks) ===
+app = FastAPI(title="Vol Platform", lifespan=lifespan)
+
+# === Maths ===
 R = 0.043
 
 def bs_price(S, K, T, r, sigma, right='C'):
@@ -59,7 +61,7 @@ def bs_greeks(S, K, T, r, sigma, right='C'):
 
 # === API Endpoints ===
 @app.get("/api/spot/{symbol}")
-async def get_spot(symbol: str):
+def get_spot(symbol: str):
     contract = Stock(symbol.upper(), 'SMART', 'USD')
     ib.qualifyContracts(contract)
     ticker = ib.reqMktData(contract, '', False, False)
@@ -75,17 +77,15 @@ async def get_spot(symbol: str):
     return result
 
 @app.get("/api/chain/{symbol}")
-async def get_chain(symbol: str):
+def get_chain(symbol: str):
     contract = Stock(symbol.upper(), 'SMART', 'USD')
     ib.qualifyContracts(contract)
     
-    # Spot
     ticker = ib.reqMktData(contract, '', False, False)
     ib.sleep(3)
     spot = ticker.last if ticker.last > 0 else ticker.close
     ib.cancelMktData(contract)
     
-    # Chain discovery
     chains = ib.reqSecDefOptParams(contract.symbol, '', contract.secType, contract.conId)
     chain = next((c for c in chains if c.exchange == 'SMART'), None)
     if not chain:
@@ -94,7 +94,6 @@ async def get_chain(symbol: str):
     expirations = [e for e in sorted(chain.expirations) if e >= pd.Timestamp.now().strftime('%Y%m%d')][:3]
     strikes = [s for s in sorted(chain.strikes) if spot * 0.90 <= s <= spot * 1.10]
     
-    # Construire et qualifier les options
     option_contracts = []
     for exp in expirations:
         for strike in strikes:
@@ -108,7 +107,6 @@ async def get_chain(symbol: str):
         qualified.extend([c for c in batch if c.conId > 0])
         ib.sleep(0.5)
     
-    # Quotes
     option_data = []
     for i in range(0, len(qualified), 50):
         batch = qualified[i:i+50]
@@ -145,7 +143,7 @@ async def get_chain(symbol: str):
 
 # === Frontend HTML ===
 @app.get("/", response_class=HTMLResponse)
-async def frontend():
+def frontend():
     return """
     <!DOCTYPE html>
     <html>
@@ -217,12 +215,11 @@ async def frontend():
                 }
                 
                 document.getElementById('spotInfo').innerHTML = 
-                    `<span>${data.symbol}</span> — Spot: <span>$${data.spot}</span>`;
+                    '<span>' + data.symbol + '</span> — Spot: <span>$' + data.spot + '</span>';
                 
                 const opts = data.options.filter(o => o.iv !== null);
                 const expiries = [...new Set(opts.map(o => o.expiry))].sort();
                 
-                // Smile chart
                 const smileTraces = [];
                 expiries.forEach(exp => {
                     const calls = opts.filter(o => o.expiry === exp && o.right === 'C');
@@ -237,37 +234,34 @@ async def frontend():
                     font: {color: '#e0e0e0'}, legend: {font: {size: 10}}
                 });
                 
-                // Delta chart
                 const exp0 = expiries[0];
                 const calls0 = opts.filter(o => o.expiry === exp0 && o.right === 'C');
+                
                 Plotly.newPlot('deltaChart', [{
                     x: calls0.map(o => o.strike), y: calls0.map(o => o.delta),
                     mode: 'lines+markers', marker: {size: 4, color: '#2d7ff9'}
                 }], {title: 'Delta (Calls)', xaxis: {title: 'Strike'}, yaxis: {title: 'Delta'},
                     paper_bgcolor: '#1a1d29', plot_bgcolor: '#1a1d29', font: {color: '#e0e0e0'}, showlegend: false});
                 
-                // Gamma chart
                 Plotly.newPlot('gammaChart', [{
                     x: calls0.map(o => o.strike), y: calls0.map(o => o.gamma),
                     mode: 'lines+markers', marker: {size: 4, color: '#ff4444'}
                 }], {title: 'Gamma', xaxis: {title: 'Strike'}, yaxis: {title: 'Gamma'},
                     paper_bgcolor: '#1a1d29', plot_bgcolor: '#1a1d29', font: {color: '#e0e0e0'}, showlegend: false});
                 
-                // Vega chart
                 Plotly.newPlot('vegaChart', [{
                     x: calls0.map(o => o.strike), y: calls0.map(o => o.vega),
                     mode: 'lines+markers', marker: {size: 4, color: '#aa44ff'}
                 }], {title: 'Vega', xaxis: {title: 'Strike'}, yaxis: {title: 'Vega'},
                     paper_bgcolor: '#1a1d29', plot_bgcolor: '#1a1d29', font: {color: '#e0e0e0'}, showlegend: false});
                 
-                // Table
                 let html = '<table><tr><th>Expiry</th><th>Strike</th><th>Type</th><th>Bid</th><th>Ask</th><th>IV</th><th>Delta</th><th>Gamma</th><th>Vega</th><th>Theta</th></tr>';
                 opts.forEach(o => {
-                    html += `<tr><td>${o.expiry}</td><td>${o.strike}</td><td>${o.right}</td>
-                        <td>${o.bid?.toFixed(2) || '-'}</td><td>${o.ask?.toFixed(2) || '-'}</td>
-                        <td>${(o.iv*100).toFixed(1)}%</td><td>${o.delta?.toFixed(3) || '-'}</td>
-                        <td>${o.gamma?.toFixed(5) || '-'}</td><td>${o.vega?.toFixed(3) || '-'}</td>
-                        <td>${o.theta?.toFixed(3) || '-'}</td></tr>`;
+                    html += '<tr><td>' + o.expiry + '</td><td>' + o.strike + '</td><td>' + o.right + '</td>'
+                        + '<td>' + (o.bid?.toFixed(2) || '-') + '</td><td>' + (o.ask?.toFixed(2) || '-') + '</td>'
+                        + '<td>' + (o.iv*100).toFixed(1) + '%</td><td>' + (o.delta?.toFixed(3) || '-') + '</td>'
+                        + '<td>' + (o.gamma?.toFixed(5) || '-') + '</td><td>' + (o.vega?.toFixed(3) || '-') + '</td>'
+                        + '<td>' + (o.theta?.toFixed(3) || '-') + '</td></tr>';
                 });
                 html += '</table>';
                 document.getElementById('chainTable').innerHTML = html;
